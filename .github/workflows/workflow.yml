@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   processor:
-    runs-on: macos-26   # was: ubuntu-latest
+    runs-on: macos-latest-xlarge   # was: ubuntu-latest
     timeout-minutes: 355
 
     steps:
