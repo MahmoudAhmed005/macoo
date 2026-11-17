@@ -1,0 +1,329 @@
+name: CI Worker Node
+
+on:
+  workflow_dispatch:
+    inputs:
+      worker_id:
+        description: 'Worker ID'
+        required: true
+        default: 'generic-worker'
+      restore_source:
+        description: 'repo | artifact | release | all | none'
+        required: true
+        default: 'all'
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  processor:
+    runs-on: macos-latest          # was: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      # ============================================================
+      # 1. TAILSCALE
+      # ============================================================
+      - name: Initialize Network
+        uses: tailscale/github-action@v2
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: ${{ github.event.inputs.worker_id }}
+          tags: tag:ci
+          args: --ssh
+
+      # ============================================================
+      # 2. RESTORE
+      # ============================================================
+      - name: Fetch Environment State
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_PAT }}
+          REPO_NAME: ${{ secrets.BACKUP_REPO }}
+          ENC_PASS: ${{ secrets.ENCRYPTION_PASS }}
+          RESTORE_SOURCE: ${{ github.event.inputs.restore_source }}
+          TARGET_USER: ${{ github.event.inputs.worker_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p /Users/runner/work          # was: /home/runner/work
+          cd /Users/runner/work
+
+          CLEAN_TOKEN=$(echo -n "$GH_TOKEN" | tr -d '[:space:]')
+          CLEAN_REPO=$(echo -n "$REPO_NAME" | tr -d '[:space:]')
+
+          decrypt_blob() {
+            local in="$1" out="$2"
+            for iter in 100000 10000 1000 1; do
+              if openssl enc -aes-256-cbc -d -pbkdf2 -iter "$iter" \
+                   -pass pass:"$ENC_PASS" -in "$in" -out "$out" 2>/dev/null; then
+                echo "Decrypted with iter=$iter"
+                return 0
+              fi
+            done
+            echo "All decryption attempts failed for $in"
+            return 1
+          }
+
+          if [[ "$RESTORE_SOURCE" == "none" ]]; then
+            echo "Skipping restore (source=none)."
+            exit 0
+          fi
+
+          # --- A. Private repo chunks ---
+          if [[ "$RESTORE_SOURCE" == "repo" || "$RESTORE_SOURCE" == "all" ]]; then
+            if git clone "https://x-access-token:${CLEAN_TOKEN}@github.com/${{ github.repository_owner }}/${CLEAN_REPO}.git" state-repo 2>/dev/null; then
+              if ls state-repo/chunks/state_part_* 1>/dev/null 2>&1; then
+                cat state-repo/chunks/state_part_* > /tmp/repo.tar.gz.enc
+                if decrypt_blob /tmp/repo.tar.gz.enc /tmp/repo.tar.gz; then
+                  sudo tar -xzf /tmp/repo.tar.gz -C / --no-same-owner
+                  echo "Restored from REPO"
+                fi
+              fi
+            fi
+          fi
+
+          # --- B. Artifact (whole encrypted blob) ---
+          if [[ "$RESTORE_SOURCE" == "artifact" || "$RESTORE_SOURCE" == "all" ]]; then
+            ART_ID=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=state-backup" \
+              --jq '.artifacts | sort_by(.created_at) | last | .id' 2>/dev/null || echo "")
+            if [[ -n "$ART_ID" && "$ART_ID" != "null" ]]; then
+              gh api "repos/${{ github.repository }}/actions/artifacts/${ART_ID}/zip" > /tmp/artifact.zip
+              rm -rf /tmp/artifact && unzip -o /tmp/artifact.zip -d /tmp/artifact
+              if decrypt_blob /tmp/artifact/state.tar.gz.enc /tmp/artifact.tar.gz; then
+                sudo tar -xzf /tmp/artifact.tar.gz -C / --no-same-owner
+                echo "Restored from ARTIFACT"
+              fi
+            fi
+          fi
+
+          # --- C. Release (whole encrypted blob) ---
+          if [[ "$RESTORE_SOURCE" == "release" || "$RESTORE_SOURCE" == "all" ]]; then
+            rm -rf /tmp/release && mkdir -p /tmp/release
+            if gh release download --repo "${{ github.repository }}" \
+                 --pattern 'state.tar.gz.enc' --dir /tmp/release 2>/dev/null; then
+              if decrypt_blob /tmp/release/state.tar.gz.enc /tmp/release.tar.gz; then
+                sudo tar -xzf /tmp/release.tar.gz -C / --no-same-owner
+                echo "Restored from RELEASE"
+              fi
+            fi
+          fi
+
+          # --- D. Post-restore cleanup ---
+          if id "$TARGET_USER" &>/dev/null; then
+            sudo mkdir -p "/Users/$TARGET_USER"       # was: /home/$TARGET_USER
+            sudo chown -R "$TARGET_USER" "/Users/$TARGET_USER" 2>/dev/null || true
+            echo "Fixed ownership of /Users/$TARGET_USER"
+          fi
+
+      # ============================================================
+      # 3. PAYLOAD
+      # ============================================================
+      - name: Process Workload
+        run: |
+          set -euo pipefail
+          TARGET_USER="${{ github.event.inputs.worker_id }}"
+
+          # Create user if missing (macOS: sysadminctl instead of useradd)
+          if ! id "$TARGET_USER" &>/dev/null; then
+            sudo sysadminctl -addUser "$TARGET_USER" \
+              -fullName "$TARGET_USER" \
+              -shell /bin/bash \
+              -home "/Users/$TARGET_USER" \
+              -password "$(openssl rand -hex 16)" 2>&1 || true
+            sudo createhomedir -c -u "$TARGET_USER" 2>/dev/null || true
+          fi
+          if ! id "$TARGET_USER" &>/dev/null; then
+            echo "Failed to create user $TARGET_USER"
+            exit 1
+          fi
+
+          # Guarantee home dir exists (restore may have missed it)
+          sudo mkdir -p "/Users/$TARGET_USER"
+          sudo chown -R "$TARGET_USER" "/Users/$TARGET_USER"
+          sudo chmod 755 "/Users/$TARGET_USER"
+
+          # Passwordless sudo — macOS ignores /etc/sudoers.d unless includedir is enabled.
+          sudo mkdir -p /etc/sudoers.d
+          sudo chmod 0755 /etc/sudoers.d
+          sudo sed -i '' 's|^#includedir /private/etc/sudoers.d|#includedir /private/etc/sudoers.d|' /etc/sudoers
+          echo "$TARGET_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee "/etc/sudoers.d/99-$TARGET_USER" >/dev/null
+          sudo chmod 0440 "/etc/sudoers.d/99-$TARGET_USER"
+
+          # Verify sudoers.d include actually took effect; fall back to direct append.
+          if ! sudo -u "$TARGET_USER" sudo -n true 2>/dev/null; then
+            echo "sudoers.d include not active — appending directly to /etc/sudoers"
+            echo "$TARGET_USER ALL=(ALL) NOPASSWD:ALL" | sudo tee -a /etc/sudoers >/dev/null
+            sudo visudo -c || { echo "sudoers validation failed"; exit 1; }
+          fi
+
+          # Launch workload and remember its PID
+          if [ -f "/Users/$TARGET_USER/.cloud_init" ]; then
+            echo "Launching .cloud_init..."
+            sudo -u "$TARGET_USER" bash "/Users/$TARGET_USER/.cloud_init" > /dev/null 2>&1 &
+            WORKLOAD_PID=$!
+            echo "$WORKLOAD_PID" | sudo tee "/Users/$TARGET_USER/.cloud_init.pid" >/dev/null
+            echo "Workload PID: $WORKLOAD_PID"
+          else
+            echo "No .cloud_init found, running idle."
+          fi
+
+          MAX_TICKS=$((5 * 60 * 60 / 10))
+          for i in $(seq 1 $MAX_TICKS); do
+            if [ -f /tmp/stop_worker ]; then
+              echo "Stop marker found at tick $i"
+              break
+            fi
+            sleep 10
+          done
+          echo "Workload loop exited after $i ticks (~$((i*10))s)"
+
+      # ============================================================
+      # 4. FINALIZE
+      # ============================================================
+      - name: Finalize Environment State
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_PAT }}
+          REPO_NAME: ${{ secrets.BACKUP_REPO }}
+          ENC_PASS: ${{ secrets.ENCRYPTION_PASS }}
+          TARGET_USER: ${{ github.event.inputs.worker_id }}
+        run: |
+          set -euo pipefail
+          echo "Finalizing state..."
+
+          if [ -f "/Users/$TARGET_USER/.cloud_init.pid" ]; then
+            WORKLOAD_PID=$(sudo cat "/Users/$TARGET_USER/.cloud_init.pid" 2>/dev/null || echo "")
+            if [ -n "$WORKLOAD_PID" ] && kill -0 "$WORKLOAD_PID" 2>/dev/null; then
+              echo "Sending SIGINT to workload PID $WORKLOAD_PID"
+              sudo kill -SIGINT "$WORKLOAD_PID" 2>/dev/null || true
+              sleep 10
+            else
+              echo "Workload PID $WORKLOAD_PID not running."
+            fi
+          else
+            echo "No workload PID file, skipping signal."
+          fi
+
+          cd /Users/runner/work
+          CLEAN_TOKEN=$(echo -n "$GH_TOKEN" | tr -d '[:space:]')
+          CLEAN_REPO=$(echo -n "$REPO_NAME" | tr -d '[:space:]')
+
+          if [ ! -d "/Users/$TARGET_USER" ]; then
+            echo "⚠️  /Users/$TARGET_USER missing — creating empty dir for backup"
+            sudo mkdir -p "/Users/$TARGET_USER"
+            sudo chown "$TARGET_USER" "/Users/$TARGET_USER"
+          fi
+
+          sudo tar -czPf - \
+            --exclude=/Users/runner/work/state-repo \
+            --exclude=/Users/runner/work/_actions \
+            --exclude='*/.git' \
+            --exclude="/Users/$TARGET_USER/.omniroute/runtime" \
+            --exclude="/Users/$TARGET_USER/.omniroute/tls-client" \
+            --exclude="/Users/$TARGET_USER/.omniroute/logs" \
+            --exclude="/Users/$TARGET_USER/.omniroute/call_logs" \
+            /Users/runner/work /Users/"$TARGET_USER" 2>/dev/null \
+            | openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt \
+                -pass pass:"$ENC_PASS" -out /tmp/state.tar.gz.enc
+
+          # macOS ships shasum, not sha256sum
+          shasum -a 256 /tmp/state.tar.gz.enc | awk '{print $1}' > /tmp/state.sha256
+          echo "LOCAL HASH: $(cat /tmp/state.sha256)"
+
+          mkdir -p /tmp/artifact-out
+          cp /tmp/state.tar.gz.enc /tmp/artifact-out/
+          cp /tmp/state.sha256      /tmp/artifact-out/
+
+          mkdir -p state-repo/chunks
+          rm -f state-repo/chunks/state_part_*
+          split -b 50m /tmp/state.tar.gz.enc state-repo/chunks/state_part_   # BSD split: lowercase m
+
+          cd state-repo
+          if [ ! -d ".git" ]; then
+            git init
+            git branch -m main
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan temp-branch 2>/dev/null || git checkout temp-branch
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/state.sha256 ./state.sha256
+          git add chunks/ state.sha256
+          git commit -m "Automated State Finalization [skip ci]" || echo "nothing to commit"
+          git branch -M main
+          git push -f "https://x-access-token:${CLEAN_TOKEN}@github.com/${{ github.repository_owner }}/${CLEAN_REPO}.git" main
+
+          TAG="state-$(date +%Y%m%d-%H%M%S)"
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "Encrypted State $TAG" \
+            --notes "sha256: $(cat /tmp/state.sha256)" \
+            /tmp/state.tar.gz.enc /tmp/state.sha256 || true
+
+      # ============================================================
+      # 5. UPLOAD ARTIFACT
+      # ============================================================
+      - name: Upload Encrypted Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-backup
+          path: |
+            /tmp/artifact-out/state.tar.gz.enc
+            /tmp/artifact-out/state.sha256
+          retention-days: 30
+
+      # ============================================================
+      # 6. COMPARE HASHES
+      # ============================================================
+      - name: Compare Hashes Across Sources
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.BACKUP_PAT }}
+        run: |
+          set -euo pipefail
+          cd /Users/runner/work
+
+          if [ ! -f /tmp/state.sha256 ]; then
+            echo "❌ /tmp/state.sha256 missing — finalize step failed."
+            exit 1
+          fi
+
+          LOCAL_HASH=$(cat /tmp/state.sha256)
+
+          if ls state-repo/chunks/state_part_* 1>/dev/null 2>&1; then
+            cat state-repo/chunks/state_part_* > /tmp/from_repo.enc
+            REPO_HASH=$(shasum -a 256 /tmp/from_repo.enc | awk '{print $1}')
+          else
+            REPO_HASH="MISSING"
+          fi
+
+          ART_ID=$(gh api "repos/${{ github.repository }}/actions/artifacts?name=state-backup" \
+            --jq '.artifacts | sort_by(.created_at) | last | .id' 2>/dev/null || echo "")
+          if [[ -n "$ART_ID" && "$ART_ID" != "null" ]]; then
+            gh api "repos/${{ github.repository }}/actions/artifacts/${ART_ID}/zip" > /tmp/art.zip
+            rm -rf /tmp/art && unzip -o /tmp/art.zip -d /tmp/art >/dev/null
+            ART_HASH=$(shasum -a 256 /tmp/art/state.tar.gz.enc | awk '{print $1}')
+          else
+            ART_HASH="MISSING"
+          fi
+
+          rm -rf /tmp/rel && mkdir -p /tmp/rel
+          if gh release download --repo "${{ github.repository }}" \
+               --pattern 'state.tar.gz.enc' --dir /tmp/rel 2>/dev/null; then
+            REL_HASH=$(shasum -a 256 /tmp/rel/state.tar.gz.enc | awk '{print $1}')
+          else
+            REL_HASH="MISSING"
+          fi
+
+          echo "LOCAL : $LOCAL_HASH"
+          echo "REPO  : $REPO_HASH"
+          echo "ART   : $ART_HASH"
+          echo "REL   : $REL_HASH"
+
+          if [[ "$LOCAL_HASH" == "$REPO_HASH" && "$LOCAL_HASH" == "$ART_HASH" && "$LOCAL_HASH" == "$REL_HASH" ]]; then
+            echo "✅ All sources match."
+          else
+            echo "❌ MISMATCH."
+            exit 1
+          fi
